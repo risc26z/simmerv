@@ -10,7 +10,7 @@ pub struct Clint {
     mtimecmp: u64,
     mtime_system: u64,
     mtime_delta: u64,
-    t0: SystemTime,
+    _t0: SystemTime,
 }
 
 impl Default for Clint {
@@ -28,7 +28,7 @@ impl Clint {
             mtimecmp: 0,
             mtime_system: 0,
             mtime_delta: 0,
-            t0: SystemTime::now(),
+            _t0: SystemTime::now(),
         }
     }
 
@@ -38,12 +38,12 @@ impl Clint {
     /// # Arguments
     /// * `mip` CPU `mip` register. It can be updated if interrupt occurs.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn service(&mut self, cycle: u64, mip: &mut u64) {
-        let mut msystem_time = cycle / 16; // XXX An arbitrary number that seems to work ok
+    pub const fn service(&mut self, cycle: u64, mip: &mut u64) {
+        let msystem_time = cycle / 16; // XXX An arbitrary number that seems to work ok
 
-        if let Ok(t) = self.t0.elapsed() {
+        /*if let Ok(t) = self.t0.elapsed() {
             msystem_time = t.as_micros() as u64; // 1 µs timebase
-        }
+        }*/
         self.mtime_system = msystem_time;
 
         if (self.msip & 1) != 0 {
@@ -188,7 +188,7 @@ impl Clint {
 
     /// Writes to `mtime` register content
     #[allow(dead_code)]
-    pub fn write_mtime(&mut self, mtime: u64) {
+    pub const fn write_mtime(&mut self, mtime: u64) {
         self.mtime_delta = mtime.wrapping_sub(self.mtime_system);
     }
 }
