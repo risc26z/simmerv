@@ -19,6 +19,7 @@ pub mod terminal;
 
 use crate::cpu::Cpu;
 use crate::elf_analyzer::ElfAnalyzer;
+use crate::riscv::MemoryAccessType;
 use crate::terminal::Terminal;
 use fnv::FnvHashMap;
 
@@ -127,7 +128,7 @@ impl Emulator {
         if self.tohost_addr == 0 {
             return false;
         }
-        let tohost = self.cpu.get_mut_mmu().load_phys_u64(self.tohost_addr);
+        let tohost = self.cpu.get_mut_mmu().load_phys_mem_u64(self.tohost_addr).unwrap() as u64;
         if tohost == 0 {
             return false;
         }
@@ -151,16 +152,16 @@ impl Emulator {
             //  magic_mem[1] = arg0;
             //  magic_mem[2] = arg1;
             //  magic_mem[3] = arg2;
-            let which = self.cpu.get_mut_mmu().load_phys_u64(payload);
-            let arg0 = self.cpu.get_mut_mmu().load_phys_u64(payload + 8);
-            let arg1 = self.cpu.get_mut_mmu().load_phys_u64(payload + 16);
-            let arg2 = self.cpu.get_mut_mmu().load_phys_u64(payload + 24);
+            let which = self.cpu.get_mut_mmu().load_phys_mem_u64(payload).unwrap();
+            let arg0 = self.cpu.get_mut_mmu().load_phys_mem_u64(payload + 8).unwrap();
+            let arg1 = self.cpu.get_mut_mmu().load_phys_mem_u64(payload + 16).unwrap();
+            let arg2 = self.cpu.get_mut_mmu().load_phys_mem_u64(payload + 24).unwrap();
             match which {
                 0x40 => {
                     // write
                     assert_eq!(arg0, 1);
                     for i in 0..arg2 {
-                        print!("{}", self.cpu.get_mut_mmu().load_phys_u8(arg1 + i) as char);
+                        print!("{}", self.cpu.load_phys_u8(arg1 + i).unwrap() as char);
                     }
                 }
                 syscall => todo!("System call {syscall}"),
@@ -253,8 +254,13 @@ impl Emulator {
                 for j in 0..sh_size {
                     if self
                         .cpu
-                        .get_mut_mmu()
-                        .store_phys_u8(sh_addr + j as u64, analyzer.read_byte(sh_offset + j))
+                        .memop(
+                            MemoryAccessType::Write,
+                            sh_addr as i64,
+                            j as i64,
+                            analyzer.read_byte(sh_offset + j) as i64,
+                            1,
+                        )
                         .is_err()
                     {
                         panic!(

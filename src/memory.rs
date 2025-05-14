@@ -23,53 +23,46 @@ impl Memory {
         self.0.resize(capacity, 0);
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn read_u8(&mut self, p_address: u64) -> u8 {
-        debug_assert!(
-            p_address >= DRAM_BASE,
-            "Memory address must equals to or bigger than DRAM_BASE. {p_address:X}"
-        );
-        let address = p_address - DRAM_BASE;
-        self.0[address as usize]
+    pub fn read_u8(&mut self, p_address: u64) -> Option<u8> {
+	let address = p_address.wrapping_sub(DRAM_BASE);
+	if address < self.0.len() - 1 {
+            Ok(self.0[address as usize])
+	} else {None}
     }
 
     #[allow(clippy::cast_possible_truncation)]
     /// # Panic
     /// No, it can't panic
-    pub fn read_u16(&mut self, p_address: u64) -> u16 {
-        debug_assert!(
-            p_address >= DRAM_BASE && p_address.wrapping_add(1) >= DRAM_BASE,
-            "Memory address must equals to or bigger than DRAM_BASE. {p_address:X}"
-        );
-        let address = p_address - DRAM_BASE;
-        let address = address as usize;
-        u16::from_le_bytes(self.0[address..address + 2].try_into().unwrap())
+    pub fn read_u16(&mut self, p_address: u64) -> Option<u16> {
+	let address = p_address.wrapping_sub(DRAM_BASE);
+	if address < self.0.len() - 1 {
+            let address = address as usize;
+        Ok(u16::from_le_bytes(self.0[address..address + 2].try_into().unwrap()))
+	    	} else { None }
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    pub fn read_u32(&mut self, p_address: u64) -> u32 {
-        debug_assert!(
-            p_address >= DRAM_BASE && p_address.wrapping_add(3) >= DRAM_BASE,
-            "Memory address must equals to or bigger than DRAM_BASE. {p_address:X}"
-        );
-        let address = p_address - DRAM_BASE;
-        let address = address as usize;
-        let mut buf = [0; 4];
-        buf.copy_from_slice(&self.0[address..address + 4]);
-        u32::from_le_bytes(buf)
+    pub fn read_u32(&mut self, p_address: u64) -> Option<u32> {
+	let address = p_address.wrapping_sub(DRAM_BASE);
+	if address < self.0.len() - 3 {
+            let address = address as usize;
+            let mut buf = [0; 4];
+            buf.copy_from_slice(&self.0[address..address + 4]);
+            Ok(u32::from_le_bytes(buf))
+	} else { None }
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    pub fn read_u64(&mut self, p_address: u64) -> u64 {
-        debug_assert!(
-            p_address >= DRAM_BASE && p_address.wrapping_add(7) >= DRAM_BASE,
-            "Memory address must equals to or bigger than DRAM_BASE. {p_address:X}"
-        );
-        let address = p_address - DRAM_BASE;
-        let address = address as usize;
-        let mut buf = [0; 8];
-        buf.copy_from_slice(&self.0[address..address + 8]);
-        u64::from_le_bytes(buf)
+    pub fn read_u64(&mut self, p_address: u64) -> Option<u64> {
+	let address = p_address.wrapping_sub(DRAM_BASE);
+	if address < self.0.len() - 7 {
+            let address = address as usize;
+            let mut buf = [0; 8];
+            buf.copy_from_slice(&self.0[address..address + 8]);
+            Ok(u64::from_le_bytes(buf))
+	} else {
+	    None
+	}
     }
 
     /// # Errors

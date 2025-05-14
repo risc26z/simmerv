@@ -421,12 +421,12 @@ impl VirtioBlockDisk {
         let base_used_address = self.get_base_used_address();
         let queue_size = u64::from(self.queue_size);
 
-        let _avail_flag = u64::from(memory.read_u16(base_avail_address));
-        let _avail_index = u64::from(memory.read_u16(base_avail_address.wrapping_add(2)));
+        let _avail_flag = u64::from(memory.read_u16(base_avail_address).unwrap());
+        let _avail_index = u64::from(memory.read_u16(base_avail_address.wrapping_add(2)).unwrap());
         let desc_index_address = base_avail_address
             .wrapping_add(4)
             .wrapping_add((u64::from(self.used_ring_index) % queue_size) * 2);
-        let desc_head_index = u64::from(memory.read_u16(desc_index_address)) % queue_size;
+        let desc_head_index = u64::from(memory.read_u16(desc_index_address).unwrap()) % queue_size;
 
         /*
         println!("Desc AD:{:X}", base_desc_address);
@@ -445,11 +445,11 @@ impl VirtioBlockDisk {
         let mut desc_next = desc_head_index;
         loop {
             let desc_element_address = base_desc_address + 16 * desc_next;
-            let desc_addr = memory.read_u64(desc_element_address);
+            let desc_addr = memory.read_u64(desc_element_address).unwrap();
             let desc_len = memory.read_u32(desc_element_address.wrapping_add(8));
             let desc_flags = memory.read_u16(desc_element_address.wrapping_add(12));
             desc_next =
-                u64::from(memory.read_u16(desc_element_address.wrapping_add(14))) % queue_size;
+                u64::from(memory.read_u16(desc_element_address.wrapping_add(14)).unwrap()) % queue_size;
 
             /*
             println!("Desc addr:{:X}", desc_addr);
@@ -470,8 +470,8 @@ impl VirtioBlockDisk {
 
                     // Read/Write operation can be distinguished with the second descriptor flags
                     // so we can ignore blk_type?
-                    _blk_type = memory.read_u32(desc_addr);
-                    _blk_reserved = memory.read_u32(desc_addr.wrapping_add(4));
+                    _blk_type = memory.read_u32(desc_addr).unwrap();
+                    _blk_reserved = memory.read_u32(desc_addr.wrapping_add(4)).unwrap();
                     blk_sector = memory.read_u64(desc_addr.wrapping_add(8)) as usize;
                     /*
                     println!("Blk type:{:X}", _blk_type);
