@@ -10,23 +10,23 @@ use crate::riscv;
 use crate::rvc;
 use crate::terminal;
 pub use csr::*;
-use fp::RoundingMode;
-use fp::Sf;
-use fp::Sf32;
-use fp::Sf64;
 use fp::cvt_i32_sf32;
 use fp::cvt_i64_sf32;
 use fp::cvt_u32_sf32;
 use fp::cvt_u64_sf32;
+use fp::RoundingMode;
+use fp::Sf;
+use fp::Sf32;
+use fp::Sf64;
 use log;
 use num_traits::FromPrimitive;
+use riscv::priv_mode_from;
 use riscv::MemoryAccessType;
 use riscv::MemoryAccessType::Execute;
 use riscv::MemoryAccessType::Read;
 use riscv::MemoryAccessType::Write;
 use riscv::PrivMode;
 use riscv::Trap;
-use riscv::priv_mode_from;
 use std::fmt::Write as _;
 use terminal::Terminal;
 
@@ -160,11 +160,14 @@ impl Cpu {
 
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn read_x(&self, r: Reg) -> i64 { self.rf[r] }
+    #[must_use]
+    pub fn read_x(&self, r: Reg) -> i64 { self.rf[r] }
 
     #[allow(clippy::inline_always)]
     #[inline(always)]
-    fn write_x(&mut self, r: Reg, v: i64) {
+    /// # Panics
+    /// On internal errors
+    pub fn write_x(&mut self, r: Reg, v: i64) {
         assert_ne!(r.get(), 0);
         self.rf[r] = v;
     }
@@ -898,7 +901,11 @@ impl Cpu {
             r |= u64::from(b) << (i * 8);
             v >>= 8;
         }
-        if access == Write { Ok(0) } else { Ok(r as i64) }
+        if access == Write {
+            Ok(0)
+        } else {
+            Ok(r as i64)
+        }
     }
 }
 
@@ -4119,13 +4126,13 @@ mod test_cpu {
         // Test x0
         assert_eq!(0, cpu.read_register(x(0)));
         cpu.run_soc(1); // Execute  "addi x0, x0, 1"
-        // x0 is still zero because it's hardcoded zero
+                        // x0 is still zero because it's hardcoded zero
         assert_eq!(0, cpu.read_register(x(0)));
 
         // Test x1
         assert_eq!(0, cpu.read_register(x(1)));
         cpu.run_soc(1); // Execute  "addi x1, x1, 1"
-        // x1 is not hardcoded zero
+                        // x1 is not hardcoded zero
         assert_eq!(1, cpu.read_register(x(1)));
     }
 }
