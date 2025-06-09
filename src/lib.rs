@@ -16,6 +16,7 @@ pub mod memory;
 pub mod mmu;
 pub mod riscv;
 pub mod rvc;
+pub mod superfast;
 pub mod terminal;
 
 use crate::cpu::Cpu;
@@ -85,8 +86,9 @@ impl Emulator {
 
     /// Runs program set by `setup_program()`. The emulator will run forever.
     pub fn run_program(&mut self) {
+        let mut tc = superfast::TranslationCache::new();
         loop {
-            self.tick(40);
+            self.tick(&mut tc, 40);
             if self.handle_htif() {
                 break;
             }
@@ -103,12 +105,14 @@ impl Emulator {
     #[allow(clippy::cast_possible_truncation)]
     pub fn run_test(&mut self) {
         //use std::io::{self, Write};
+        let mut tc = superfast::TranslationCache::new();
 
         let mut s = String::new();
         loop {
             s.clear();
             let wbr = self.cpu.disassemble(&mut s);
-            self.tick(1);
+            tc.0.clear();
+            self.tick(&mut tc, 1);
             let cycle = self.cpu.cycle;
             print!("{cycle:5} {s:72}");
             if wbr.is_x0_dest() {
@@ -182,10 +186,10 @@ impl Emulator {
     }
 
     /// Runs CPU one cycle
-    pub fn tick(&mut self, n: usize) {
+    pub fn tick(&mut self, tc: &mut superfast::TranslationCache, n: usize) {
         // XXX We should be able to set this arbitrarily high, but we seem
         // to hit a race condition and a Linux hang beyond this value
-        self.cpu.run_soc(n);
+        self.cpu.run_soc(tc, n);
     }
 
     /// Sets up program run by the program. This method analyzes the passed

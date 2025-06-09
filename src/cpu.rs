@@ -8,25 +8,29 @@ use crate::fp;
 use crate::mmu::Mmu;
 use crate::riscv;
 use crate::rvc;
+use crate::superfast::Code;
+use crate::superfast::Op;
+use crate::superfast::TranslationCache;
+use crate::superfast::execute;
 use crate::terminal;
 pub use csr::*;
-use fp::cvt_i32_sf32;
-use fp::cvt_i64_sf32;
-use fp::cvt_u32_sf32;
-use fp::cvt_u64_sf32;
 use fp::RoundingMode;
 use fp::Sf;
 use fp::Sf32;
 use fp::Sf64;
+use fp::cvt_i32_sf32;
+use fp::cvt_i64_sf32;
+use fp::cvt_u32_sf32;
+use fp::cvt_u64_sf32;
 use log;
 use num_traits::FromPrimitive;
-use riscv::priv_mode_from;
 use riscv::MemoryAccessType;
 use riscv::MemoryAccessType::Execute;
 use riscv::MemoryAccessType::Read;
 use riscv::MemoryAccessType::Write;
 use riscv::PrivMode;
 use riscv::Trap;
+use riscv::priv_mode_from;
 use std::fmt::Write as _;
 use terminal::Terminal;
 
@@ -74,10 +78,10 @@ pub fn f(r: u32) -> Reg {
 pub struct Cpu {
     // The essential CPU state
     rf: [i64; 65],
-    pc: i64,
-    frm_: RoundingMode, // XXX make this accessor functions on fcsr
-    fflags_: u8,        // XXX make this accessor functions on fcsr
-    fs: u8,             // XXX This is redundant and usage is suspect
+    pub pc: i64,
+    pub frm_: RoundingMode, // XXX make this accessor functions on fcsr
+    pub fflags_: u8,        // XXX make this accessor functions on fcsr
+    pub fs: u8,             // XXX This is redundant and usage is suspect
 
     // Supervisor and CSR
     pub cycle: u64,
@@ -206,9 +210,9 @@ impl Cpu {
     /// Runs program N cycles. Fetch, decode, and execution are completed in a
     /// cycle so far.
     #[allow(clippy::cast_sign_loss)]
-    pub fn run_soc(&mut self, cpu_steps: usize) {
+    pub fn run_soc(&mut self, cache: &mut TranslationCache, cpu_steps: usize) {
         for _ in 0..cpu_steps {
-            if let Err(exc) = self.step_cpu() {
+            if let Err(exc) = self.step_cpu(cache) {
                 self.handle_exception(&exc);
             }
 
@@ -222,7 +226,7 @@ impl Cpu {
 
     // It's here, the One Key Function.  This is where it all happens!
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    fn step_cpu(&mut self) -> Result<(), Exception> {
+    fn step_cpu(&mut self, _cache: &mut TranslationCache) -> Result<(), Exception> {
         self.cycle = self.cycle.wrapping_add(1);
 
         if self.wfi {
@@ -234,21 +238,85 @@ impl Cpu {
 
         // Fetch
         self.insn_addr = self.pc;
-        let word = self.memop(Execute, self.insn_addr, 0, 0, 4)?;
+        self.insn = self.memop(Execute, self.insn_addr, 0, 0, 4)? as u32;
         self.seqno = self.seqno.wrapping_add(1);
-        self.insn = word as u32;
 
         // Decode
-        let (insn, npc) = decompress(self.insn_addr, word as u32);
+        let (insn32, npc) = decompress(self.insn_addr, self.insn);
         self.pc = npc;
-        let Ok(decoded) = decode(&self.decode_dag, insn) else {
+        let Ok(decoded) = decode(&self.decode_dag, insn32) else {
             return Err(Exception {
                 trap: Trap::IllegalInstruction,
-                tval: word,
+                tval: i64::from(self.insn),
             });
         };
 
-        (decoded.operation)(self, self.insn_addr, insn)
+        if let Ok(code) = (decoded.translate)(self.insn_addr, insn32, self.insn) {
+            return execute(&vec![code], self);
+        }
+
+        // Execute
+        (decoded.operation)(self, self.insn_addr, insn32)?;
+
+        /*
+        Some future bin translation
+
+        if self.ending_bb(self.insn_addr, insn) {
+            match cache.0.get_mut(&self.pc) {
+                Some(CacheEntry::Code(code)) => return execute(code, self),
+                Some(CacheEntry::Count(n)) => {
+                    *n += 1;
+                    if *n > 20 {
+                        let code = self.translate(self.pc);
+                        super::superfast::execute(&code, self)?;
+                        cache.0.insert(self.pc, CacheEntry::Code(code));
+                    }
+                }
+                None => {
+                    let _ = cache.0.insert(self.pc, CacheEntry::Count(1));
+                }
+            }
+        }
+        */
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn ending_bb(&self, pc: i64, insn: u32) -> bool {
+        let (insn32, _) = decompress(pc, insn);
+        if let Ok(entry) = decode(&self.decode_dag, insn32) {
+            if (entry.translate)(pc, insn32, insn).is_ok() {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[allow(dead_code)]
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_sign_loss)]
+    fn translate(&mut self, mut pc: i64) -> Code {
+        let mut code = Vec::new();
+
+        loop {
+            let word = self.memop(Execute, pc, 0, 0, 4);
+            let Ok(word) = word else {
+                break;
+            };
+            let (insn, npc) = decompress(self.insn_addr, word as u32);
+            let (insn, _) = decompress(pc, insn);
+            if let Ok(entry) = decode(&self.decode_dag, insn) {
+                if let Ok(k) = (entry.translate)(pc, insn, word as u32) {
+                    code.push(k);
+                    pc = npc;
+                    continue;
+                }
+            }
+
+            break;
+        }
+        assert!(!code.is_empty());
+        code
     }
 
     #[allow(clippy::cast_sign_loss)]
@@ -901,11 +969,7 @@ impl Cpu {
             r |= u64::from(b) << (i * 8);
             v >>= 8;
         }
-        if access == Write {
-            Ok(0)
-        } else {
-            Ok(r as i64)
-        }
+        if access == Write { Ok(0) } else { Ok(r as i64) }
     }
 }
 
@@ -925,6 +989,7 @@ struct Instruction {
     name: &'static str,
     operation: fn(cpu: &mut Cpu, address: i64, word: u32) -> Result<(), Exception>,
     disassemble: fn(s: &mut String, cpu: &Cpu, address: i64, word: u32, evaluate: bool) -> Reg,
+    translate: fn(address: i64, word: u32, orig_word: u32) -> Result<Op, Exception>,
 }
 
 #[inline]
@@ -1115,19 +1180,19 @@ struct FormatJ {
 }
 
 #[allow(clippy::cast_lossless)]
-fn parse_format_j(word: u32) -> FormatJ {
+fn parse_format_j<T>(word: u32, con: impl Fn(Reg, i64) -> T) -> T {
     let iword = word as i32;
-    FormatJ {
-        rd: xd((word >> 7) & 0x1f), // [11:7]
-        imm: (iword >> 31 << 20 | // imm[31:20] = [31]
+    con(
+        xd((word >> 7) & 0x1f), // [11:7]
+        (iword >> 31 << 20 | // imm[31:20] = [31]
              (iword & 0x000f_f000) | // imm[19:12] = [19:12]
              ((iword & 0x0010_0000) >> 9) | // imm[11] = [20]
              ((iword & 0x7fe0_0000) >> 20)) as i64, // imm[10:1] = [30:21]
-    }
+    )
 }
 
 fn dump_format_j(s: &mut String, _cpu: &Cpu, address: i64, word: u32, _evaluate: bool) -> Reg {
-    let f = parse_format_j(word);
+    let f = parse_format_j(word, |rd, imm| FormatJ { rd, imm });
     *s += get_register_name(f.rd);
     let _ = write!(s, ", {:x}", address.wrapping_add(f.imm));
     f.rd
@@ -1367,6 +1432,11 @@ const fn get_register_name(num: Reg) -> &'static str {
     ][num.get() as usize]
 }
 
+const DUMMY_ERROR: Result<Op, Exception> = Err(Exception {
+    trap: Trap::UserExternalInterrupt,
+    tval: 0,
+});
+
 const INSTRUCTION_NUM: usize = 173;
 
 #[allow(
@@ -1388,6 +1458,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_u,
+        translate: |_address, word, _orig_word| {
+            let FormatU { rd, imm } = parse_format_u(word);
+            Ok(Op::Const(rd, imm))
+        },
     },
     Instruction {
         mask: 0x0000007f,
@@ -1399,18 +1473,31 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_u,
+        translate: |address, word, _orig_word| {
+            let FormatU { rd, imm } = parse_format_u(word);
+            Ok(Op::Const(rd, address.wrapping_add(imm)))
+        },
     },
     Instruction {
         mask: 0x0000007f,
         bits: 0x0000006f,
         name: "JAL",
         operation: |cpu, address, word| {
-            let f = parse_format_j(word);
+            let f = parse_format_j(word, |rd, imm| FormatJ { rd, imm });
             cpu.write_x(f.rd, cpu.pc);
             cpu.pc = address.wrapping_add(f.imm);
             Ok(())
         },
         disassemble: dump_format_j,
+        translate: |address, word, orig_word| {
+            parse_format_j(word, |rd, imm| {
+                Ok(Op::Jal(
+                    rd,
+                    address + (if orig_word % 4 == 3 { 4 } else { 2 }),
+                    address.wrapping_add(imm),
+                ))
+            })
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1433,6 +1520,15 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             *s += ")";
             f.rd
         },
+        translate: |address, word, orig_word| {
+            let FormatI { rd, rs1, imm } = parse_format_i(word);
+            Ok(Op::Jalr(
+                rd,
+                address + (if orig_word % 4 == 3 { 4 } else { 2 }),
+                rs1,
+                imm as i16,
+            ))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1446,6 +1542,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_b,
+        translate: |address, word, _orig_word| {
+            let FormatB { rs1, rs2, imm } = parse_format_b(word);
+            Ok(Op::Beq(rs1, rs2, address.wrapping_add(imm)))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1459,6 +1559,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_b,
+        translate: |address, word, _orig_word| {
+            let FormatB { rs1, rs2, imm } = parse_format_b(word);
+            Ok(Op::Bne(rs1, rs2, address.wrapping_add(imm)))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1472,6 +1576,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_b,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1485,6 +1590,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_b,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1498,6 +1604,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_b,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1511,6 +1618,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_b,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1524,6 +1632,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i_mem,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1537,6 +1646,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i_mem,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1550,6 +1660,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i_mem,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1563,6 +1674,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i_mem,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1576,6 +1688,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i_mem,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1589,6 +1702,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_s,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1602,6 +1716,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_s,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1615,6 +1730,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_s,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1627,6 +1743,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1639,6 +1756,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1651,6 +1769,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1663,6 +1782,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1675,6 +1795,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1687,6 +1808,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // RV32I SLLI subsumed by RV64I
     // RV32I SRLI subsumed by RV64I
@@ -1703,6 +1825,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1716,6 +1839,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1729,6 +1853,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1742,6 +1867,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1755,6 +1881,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1768,6 +1895,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1781,6 +1909,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1794,6 +1923,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1807,6 +1937,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1820,6 +1951,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf000707f,
@@ -1835,6 +1967,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_empty,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf000707f,
@@ -1845,6 +1978,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_empty,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xffffffff,
@@ -1862,6 +1996,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             })
         },
         disassemble: dump_empty,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xffffffff,
@@ -1877,6 +2012,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             })
         },
         disassemble: dump_empty,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // RV64I
     Instruction {
@@ -1891,6 +2027,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i_mem,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1904,6 +2041,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i_mem,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1917,6 +2055,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_s,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfc00707f, // RV64I version!
@@ -1931,6 +2070,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_ri,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfc00707f,
@@ -1945,6 +2085,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_ri,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfc00707f,
@@ -1959,6 +2100,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_ri,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -1971,6 +2113,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1984,6 +2127,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_ri,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1998,6 +2142,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_ri,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2011,6 +2156,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_ri,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2024,6 +2170,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2037,6 +2184,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2050,6 +2198,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2063,6 +2212,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2076,6 +2226,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // RV32/RV64 Zifencei
     Instruction {
@@ -2088,6 +2239,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_empty,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // RV32/RV64 Zicsr
     Instruction {
@@ -2109,6 +2261,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_csr,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -2125,6 +2278,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_csr,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -2141,6 +2295,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_csr,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -2160,6 +2315,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_csri,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -2175,6 +2331,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_csri,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -2190,6 +2347,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_csri,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // RV32M
     Instruction {
@@ -2204,6 +2362,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2217,6 +2376,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2233,6 +2393,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2246,6 +2407,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2265,6 +2427,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2282,6 +2445,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2301,6 +2465,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2317,6 +2482,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // RV64M
     Instruction {
@@ -2331,6 +2497,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2350,6 +2517,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2367,6 +2535,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2386,6 +2555,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2402,6 +2572,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // RV32A
     Instruction {
@@ -2420,6 +2591,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2442,6 +2614,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2457,6 +2630,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2472,6 +2646,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2487,6 +2662,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2502,6 +2678,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2517,6 +2694,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2533,6 +2711,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2549,6 +2728,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2565,6 +2745,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2581,6 +2762,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // RV64A
     Instruction {
@@ -2599,6 +2781,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2621,6 +2804,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2636,6 +2820,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2651,6 +2836,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2666,6 +2852,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2681,6 +2868,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2696,6 +2884,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2712,6 +2901,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2728,6 +2918,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2744,6 +2935,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xf800707f,
@@ -2760,6 +2952,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // RV32F
     Instruction {
@@ -2775,6 +2968,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i_mem,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -2788,6 +2982,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             cpu.mmu.store_virt_u32_(s1.wrapping_add(f.imm), s2)
         },
         disassemble: dump_format_s,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0600007f,
@@ -2804,6 +2999,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r2_ffff,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0600007f,
@@ -2820,6 +3016,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r2_ffff,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0600007f,
@@ -2837,6 +3034,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r2_ffff,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0600007f,
@@ -2854,6 +3052,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r2_ffff,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00007f,
@@ -2866,6 +3065,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00007f,
@@ -2878,6 +3078,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00007f,
@@ -2891,6 +3092,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00007f,
@@ -2918,6 +3120,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -2930,6 +3133,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2945,6 +3149,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2960,6 +3165,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2975,6 +3181,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2989,6 +3196,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3003,6 +3211,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3015,6 +3224,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3027,6 +3237,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0707f,
@@ -3039,6 +3250,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3053,6 +3265,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3067,6 +3280,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3081,6 +3295,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0707f,
@@ -3093,6 +3308,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3107,6 +3323,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3121,6 +3338,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0707f,
@@ -3134,6 +3352,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r_f,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // RV64F
     Instruction {
@@ -3147,6 +3366,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3159,6 +3379,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3173,6 +3394,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3189,6 +3411,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // RV32D
     Instruction {
@@ -3204,6 +3427,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0000707f,
@@ -3217,6 +3441,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             cpu.mmu.store64(s1.wrapping_add(f.imm), s2)
         },
         disassemble: dump_format_s,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0600007f,
@@ -3233,6 +3458,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r2_ffff,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0600007f,
@@ -3249,6 +3475,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r2_ffff,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0600007f,
@@ -3266,6 +3493,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r2_ffff,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0x0600007f,
@@ -3283,6 +3511,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r2_ffff,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00007f,
@@ -3295,6 +3524,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00007f,
@@ -3307,6 +3537,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00007f,
@@ -3320,6 +3551,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00007f,
@@ -3344,6 +3576,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3356,6 +3589,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3371,6 +3605,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3386,6 +3621,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3401,6 +3637,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3415,6 +3652,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3429,6 +3667,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3441,6 +3680,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3455,6 +3695,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3470,6 +3711,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_empty,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3484,6 +3726,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3498,6 +3741,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0707f,
@@ -3510,6 +3754,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3522,6 +3767,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3534,6 +3780,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3547,6 +3794,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3560,6 +3808,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // RV64D
     Instruction {
@@ -3573,6 +3822,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3585,6 +3835,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0707f,
@@ -3597,6 +3848,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3610,6 +3862,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0007f,
@@ -3623,6 +3876,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfff0707f,
@@ -3636,6 +3890,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // Remaining (all system-level) that weren't listed in the instr-table
     Instruction {
@@ -3646,6 +3901,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             todo!("Handling dret requires handling all of debug mode")
         },
         disassemble: dump_empty,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xffffffff,
@@ -3668,6 +3924,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_empty,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xffffffff,
@@ -3699,6 +3956,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_empty,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe007fff,
@@ -3719,6 +3977,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_empty,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xffffffff,
@@ -3743,6 +4002,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_empty,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // Zba -- AKA, my only favorite extension
     Instruction {
@@ -3757,6 +4017,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3770,6 +4031,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3783,6 +4045,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3796,6 +4059,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3809,6 +4073,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3822,6 +4087,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3835,6 +4101,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3849,6 +4116,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // Zicond extension
     Instruction {
@@ -3863,6 +4131,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     Instruction {
         mask: 0xfe00707f,
@@ -3876,6 +4145,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
+        translate: |_, _, _| DUMMY_ERROR,
     },
     // Last one is a sentiel and must always be this illegal instruction
     Instruction {
@@ -3889,6 +4159,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             })
         },
         disassemble: dump_empty,
+        translate: |_, _, _| DUMMY_ERROR,
     },
 ];
 
@@ -3927,6 +4198,7 @@ mod test_cpu {
     #[allow(clippy::match_wild_err_arm)]
     fn tick() {
         let mut cpu = create_cpu();
+        let mut tc = TranslationCache::new();
         cpu.get_mut_mmu().init_memory(8);
         cpu.update_pc(DRAM_BASE as i64);
 
@@ -3941,12 +4213,12 @@ mod test_cpu {
             Err(_e) => panic!("Failed to store"),
         }
 
-        cpu.run_soc(1);
+        cpu.run_soc(&mut tc, 1);
 
         assert_eq!(DRAM_BASE as i64 + 4, cpu.read_pc());
         assert_eq!(1, cpu.read_register(x(1)));
 
-        cpu.run_soc(1);
+        cpu.run_soc(&mut tc, 1);
 
         assert_eq!(DRAM_BASE as i64 + 6, cpu.read_pc());
         assert_eq!(8, cpu.read_register(x(8)));
@@ -3956,6 +4228,7 @@ mod test_cpu {
     #[allow(clippy::match_wild_err_arm)]
     fn step_cpu() {
         let mut cpu = create_cpu();
+        let mut tc = TranslationCache::new();
         cpu.get_mut_mmu().init_memory(4);
         cpu.update_pc(DRAM_BASE as i64);
         // write non-compressed "addi a0, a0, 12" instruction
@@ -3965,7 +4238,7 @@ mod test_cpu {
         }
         assert_eq!(DRAM_BASE as i64, cpu.read_pc());
         assert_eq!(0, cpu.read_register(x(10)));
-        if let Err(exc) = cpu.step_cpu() {
+        if let Err(exc) = cpu.step_cpu(&mut tc) {
             cpu.handle_exception(&exc);
         }
         assert_eq!(DRAM_BASE as i64 + 4, cpu.read_pc());
@@ -3977,6 +4250,7 @@ mod test_cpu {
     #[allow(clippy::match_wild_err_arm)]
     fn decode_test() {
         let cpu = create_cpu();
+
         // 0x13 is addi instruction
         match decode(&cpu.decode_dag, 0x13) {
             Ok(inst) => assert_eq!(inst.name, "ADDI"),
@@ -4006,6 +4280,7 @@ mod test_cpu {
     fn wfi() {
         let wfi_instruction = 0x10500073;
         let mut cpu = create_cpu();
+        let mut tc = TranslationCache::new();
         // Just in case
         match decode(&cpu.decode_dag, wfi_instruction) {
             Ok(inst) => assert_eq!(inst.name, "WFI"),
@@ -4018,11 +4293,11 @@ mod test_cpu {
             Ok(()) => {}
             Err(_e) => panic!("Failed to store"),
         }
-        cpu.run_soc(1);
+        cpu.run_soc(&mut tc, 1);
         assert_eq!(DRAM_BASE as i64 + 4, cpu.read_pc());
         for _i in 0..10 {
             // Until interrupt happens, .tick() does nothing
-            cpu.run_soc(1);
+            cpu.run_soc(&mut tc, 1);
             assert_eq!(DRAM_BASE as i64 + 4, cpu.read_pc());
         }
         // Machine timer interrupt
@@ -4030,7 +4305,7 @@ mod test_cpu {
         cpu.mmu.mip |= MIP_MTIP;
         cpu.write_csr_raw(Csr::Mstatus, 0x8);
         cpu.write_csr_raw(Csr::Mtvec, 0x0);
-        cpu.run_soc(1);
+        cpu.run_soc(&mut tc, 1);
         // Interrupt happened and moved to handler
         assert_eq!(0, cpu.read_pc());
     }
@@ -4040,6 +4315,7 @@ mod test_cpu {
     fn interrupt() {
         let handler_vector = 0x10000000;
         let mut cpu = create_cpu();
+        let mut tc = TranslationCache::new();
         cpu.get_mut_mmu().init_memory(4);
         // Write non-compressed "addi x0, x0, 1" instruction
         match cpu.get_mut_mmu().store_virt_u32(DRAM_BASE, 0x00100013) {
@@ -4053,7 +4329,7 @@ mod test_cpu {
         cpu.mmu.mip |= MIP_MTIP;
         cpu.write_csr_raw(Csr::Mtvec, handler_vector);
 
-        cpu.run_soc(1);
+        cpu.run_soc(&mut tc, 1);
 
         // Interrupt isn't caught because mie is disabled
         assert_eq!(DRAM_BASE as i64 + 4, cpu.read_pc());
@@ -4062,7 +4338,7 @@ mod test_cpu {
         // Enable mie in mstatus
         cpu.write_csr_raw(Csr::Mstatus, 0x8);
 
-        cpu.run_soc(1);
+        cpu.run_soc(&mut tc, 1);
 
         // Interrupt happened and moved to handler
         assert_eq!(handler_vector as i64, cpu.read_pc());
@@ -4082,6 +4358,7 @@ mod test_cpu {
     fn exception() {
         let handler_vector = 0x10000000;
         let mut cpu = create_cpu();
+        let mut tc = TranslationCache::new();
         cpu.get_mut_mmu().init_memory(4);
         // Write ECALL instruction
         match cpu.get_mut_mmu().store_virt_u32(DRAM_BASE, 0x00000073) {
@@ -4091,7 +4368,7 @@ mod test_cpu {
         cpu.write_csr_raw(Csr::Mtvec, handler_vector);
         cpu.update_pc(DRAM_BASE as i64);
 
-        cpu.run_soc(1);
+        cpu.run_soc(&mut tc, 1);
 
         // Interrupt happened and moved to handler
         assert_eq!(handler_vector as i64, cpu.read_pc());
@@ -4109,6 +4386,7 @@ mod test_cpu {
     #[allow(clippy::match_wild_err_arm)]
     fn hardocded_zero() {
         let mut cpu = create_cpu();
+        let mut tc = TranslationCache::new();
         cpu.get_mut_mmu().init_memory(8);
         cpu.update_pc(DRAM_BASE as i64);
 
@@ -4125,14 +4403,14 @@ mod test_cpu {
 
         // Test x0
         assert_eq!(0, cpu.read_register(x(0)));
-        cpu.run_soc(1); // Execute  "addi x0, x0, 1"
-                        // x0 is still zero because it's hardcoded zero
+        cpu.run_soc(&mut tc, 1); // Execute  "addi x0, x0, 1"
+        // x0 is still zero because it's hardcoded zero
         assert_eq!(0, cpu.read_register(x(0)));
 
         // Test x1
         assert_eq!(0, cpu.read_register(x(1)));
-        cpu.run_soc(1); // Execute  "addi x1, x1, 1"
-                        // x1 is not hardcoded zero
+        cpu.run_soc(&mut tc, 1); // Execute  "addi x1, x1, 1"
+        // x1 is not hardcoded zero
         assert_eq!(1, cpu.read_register(x(1)));
     }
 }

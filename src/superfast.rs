@@ -1,14 +1,16 @@
-pub type Code = Vec<Operation>;
+pub type Code = Vec<Op>;
 use crate::cpu::Exception;
 use crate::cpu::Reg;
 
 #[derive(Default, Clone, Copy)]
-pub enum Operation {
+pub enum Op {
     #[default]
     Unimplemented,
     Const(Reg, i64),
     Jal(Reg, i64, i64),
     Jalr(Reg, i64, Reg, i16),
+    Beq(Reg, Reg, i64),
+    Bne(Reg, Reg, i64),
 }
 
 pub enum CacheEntry {
@@ -20,25 +22,34 @@ pub struct TranslationCache(pub std::collections::HashMap<i64, CacheEntry>);
 
 impl TranslationCache {
     #[must_use]
-    pub fn new() -> Self {
-        Self(std::collections::HashMap::new())
-    }
+    pub fn new() -> Self { Self(std::collections::HashMap::new()) }
 }
 
+/// # Errors
+/// Exceptions are returned as errors
 pub fn execute(code: &Code, state: &mut super::cpu::Cpu) -> Result<(), Exception> {
-    use Operation::*;
     for op in code {
-        match op {
-            Const(rd, k) => state.write_x(*rd, *k),
-            Jal(rd, retaddr, target) => {
-                state.write_x(*rd, *retaddr);
-                state.pc = *target;
+        match *op {
+            Op::Const(rd, k) => state.write_x(rd, k),
+            Op::Jal(rd, retaddr, target) => {
+                state.write_x(rd, retaddr);
+                state.pc = target;
             }
-            Jalr(rd, retaddr, rs1, delta) => {
-                state.write_x(*rd, *retaddr);
-                state.pc = state.read_x(*rs1).wrapping_add(*delta as i64);
+            Op::Jalr(rd, retaddr, rs1, offset) => {
+                state.pc = state.read_x(rs1).wrapping_add(i64::from(offset)) & !1;
+                state.write_x(rd, retaddr);
             }
-            _ => todo!(),
+            Op::Beq(rs1, rs2, target) => {
+                if state.read_x(rs1) == state.read_x(rs2) {
+                    state.pc = target;
+                }
+            }
+            Op::Bne(rs1, rs2, target) => {
+                if state.read_x(rs1) != state.read_x(rs2) {
+                    state.pc = target;
+                }
+            }
+            Op::Unimplemented => todo!(),
         }
     }
 
@@ -46,7 +57,5 @@ pub fn execute(code: &Code, state: &mut super::cpu::Cpu) -> Result<(), Exception
 }
 
 impl Default for TranslationCache {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
