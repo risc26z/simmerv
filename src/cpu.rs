@@ -224,6 +224,7 @@ impl Cpu {
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     fn step_cpu(&mut self) -> Result<(), Exception> {
         self.cycle = self.cycle.wrapping_add(1);
+
         if self.wfi {
             if self.mmu.mip & self.read_csr_raw(Csr::Mie) != 0 {
                 self.wfi = false;
@@ -231,14 +232,13 @@ impl Cpu {
             return Ok(());
         }
 
-        self.seqno = self.seqno.wrapping_add(1);
+        // Fetch
         self.insn_addr = self.pc;
-        // Exception was triggered
-        // XXX For full correctness we mustn't fail if we _can_ fetch 16-bit
-        // _and_ it turns out to be a legal instruction.
         let word = self.memop(Execute, self.insn_addr, 0, 0, 4)?;
+        self.seqno = self.seqno.wrapping_add(1);
         self.insn = word as u32;
 
+        // Decode
         let (insn, npc) = decompress(self.insn_addr, word as u32);
         self.pc = npc;
         let Ok(decoded) = decode(&self.decode_dag, insn) else {
