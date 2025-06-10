@@ -9,6 +9,7 @@ use crate::mmu::Mmu;
 use crate::riscv;
 use crate::rvc;
 use crate::superfast::Code;
+use crate::superfast::Insn;
 use crate::superfast::Op;
 use crate::superfast::TranslationCache;
 use crate::superfast::execute;
@@ -190,8 +191,10 @@ impl Cpu {
     /// Reads integer register
     ///
     /// # Arguments
-    /// * `reg` Register number. Must be 0-31
+    /// * `reg` the Register abstraction which can be both integer and floating
+    ///   point
     #[must_use]
+    #[inline]
     pub fn read_register(&self, reg: Reg) -> i64 { self.rf[reg] }
 
     /// Checks that float instructions are enabled and
@@ -861,7 +864,9 @@ impl Cpu {
         }
     }
 
-    fn memop(
+    /// # Errors
+    /// Exceptions are returned as errors
+    pub fn memop(
         &mut self,
         access: MemoryAccessType,
         baseva: i64,
@@ -989,7 +994,7 @@ struct Instruction {
     name: &'static str,
     operation: fn(cpu: &mut Cpu, address: i64, word: u32) -> Result<(), Exception>,
     disassemble: fn(s: &mut String, cpu: &Cpu, address: i64, word: u32, evaluate: bool) -> Reg,
-    translate: fn(address: i64, word: u32, orig_word: u32) -> Result<Op, Exception>,
+    translate: fn(address: i64, word: u32, orig_word: u32) -> Result<Insn, Exception>,
 }
 
 #[inline]
@@ -1432,7 +1437,7 @@ const fn get_register_name(num: Reg) -> &'static str {
     ][num.get() as usize]
 }
 
-const DUMMY_ERROR: Result<Op, Exception> = Err(Exception {
+const DUMMY_ERROR: Result<Insn, Exception> = Err(Exception {
     trap: Trap::UserExternalInterrupt,
     tval: 0,
 });
@@ -1460,7 +1465,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_u,
         translate: |_address, word, _orig_word| {
             let FormatU { rd, imm } = parse_format_u(word);
-            Ok(Op::Const(rd, imm))
+            Ok(Insn(Op::Const(rd, imm), Reg::MIN, Reg::MIN))
         },
     },
     Instruction {
@@ -1475,7 +1480,11 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_u,
         translate: |address, word, _orig_word| {
             let FormatU { rd, imm } = parse_format_u(word);
-            Ok(Op::Const(rd, address.wrapping_add(imm)))
+            Ok(Insn(
+                Op::Const(rd, address.wrapping_add(imm)),
+                Reg::MIN,
+                Reg::MIN,
+            ))
         },
     },
     Instruction {
@@ -1491,10 +1500,14 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_j,
         translate: |address, word, orig_word| {
             parse_format_j(word, |rd, imm| {
-                Ok(Op::Jal(
-                    rd,
-                    address + (if orig_word % 4 == 3 { 4 } else { 2 }),
-                    address.wrapping_add(imm),
+                Ok(Insn(
+                    Op::Jal(
+                        rd,
+                        address + (if orig_word % 4 == 3 { 4 } else { 2 }),
+                        address.wrapping_add(imm),
+                    ),
+                    Reg::MIN,
+                    Reg::MIN,
                 ))
             })
         },
@@ -1522,11 +1535,14 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         },
         translate: |address, word, orig_word| {
             let FormatI { rd, rs1, imm } = parse_format_i(word);
-            Ok(Op::Jalr(
-                rd,
-                address + (if orig_word % 4 == 3 { 4 } else { 2 }),
+            Ok(Insn(
+                Op::Jalr(
+                    rd,
+                    address + (if orig_word % 4 == 3 { 4 } else { 2 }),
+                    imm as i16,
+                ),
                 rs1,
-                imm as i16,
+                Reg::MIN,
             ))
         },
     },
@@ -1544,7 +1560,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_b,
         translate: |address, word, _orig_word| {
             let FormatB { rs1, rs2, imm } = parse_format_b(word);
-            Ok(Op::Beq(rs1, rs2, address.wrapping_add(imm)))
+            Ok(Insn(Op::Beq(address.wrapping_add(imm)), rs1, rs2))
         },
     },
     Instruction {
@@ -1561,7 +1577,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_b,
         translate: |address, word, _orig_word| {
             let FormatB { rs1, rs2, imm } = parse_format_b(word);
-            Ok(Op::Bne(rs1, rs2, address.wrapping_add(imm)))
+            Ok(Insn(Op::Bne(address.wrapping_add(imm)), rs1, rs2))
         },
     },
     Instruction {
@@ -1576,7 +1592,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_b,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _orig_word| {
+            let FormatB { rs1, rs2, imm } = parse_format_b(word);
+            Ok(Insn(Op::Blt(address.wrapping_add(imm)), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1590,7 +1609,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_b,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _orig_word| {
+            let FormatB { rs1, rs2, imm } = parse_format_b(word);
+            Ok(Insn(Op::Bge(address.wrapping_add(imm)), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1604,7 +1626,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_b,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _orig_word| {
+            let FormatB { rs1, rs2, imm } = parse_format_b(word);
+            Ok(Insn(Op::Bltu(address.wrapping_add(imm)), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1618,7 +1643,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_b,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _orig_word| {
+            let FormatB { rs1, rs2, imm } = parse_format_b(word);
+            Ok(Insn(Op::Bgeu(address.wrapping_add(imm)), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1632,7 +1660,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i_mem,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _| {
+            let FormatI { rd, rs1, imm } = parse_format_i(word);
+            Ok(Insn(Op::Lb(rd, imm as i16, address), rs1, Reg::MIN))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1646,7 +1677,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i_mem,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _| {
+            let FormatI { rd, rs1, imm } = parse_format_i(word);
+            Ok(Insn(Op::Lh(rd, imm as i16, address), rs1, Reg::MIN))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1655,12 +1689,15 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         operation: |cpu, _address, word| {
             let f = parse_format_i(word);
             let s1 = cpu.read_x(f.rs1);
-            let v = cpu.memop(Read, s1, f.imm, 0, 4)?;
-            cpu.write_x(f.rd, v as i32 as i64);
+            let v = cpu.memop(Read, s1, f.imm, 0, 4)? as i32 as i64;
+            cpu.write_x(f.rd, v);
             Ok(())
         },
         disassemble: dump_format_i_mem,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _| {
+            let FormatI { rd, rs1, imm } = parse_format_i(word);
+            Ok(Insn(Op::Lw(rd, imm as i16, address), rs1, Reg::MIN))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1674,7 +1711,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i_mem,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _| {
+            let FormatI { rd, rs1, imm } = parse_format_i(word);
+            Ok(Insn(Op::Lbu(rd, imm as i16, address), rs1, Reg::MIN))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1688,7 +1728,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i_mem,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _| {
+            let FormatI { rd, rs1, imm } = parse_format_i(word);
+            Ok(Insn(Op::Lhu(rd, imm as i16, address), rs1, Reg::MIN))
+        },
     },
     Instruction {
         mask: 0x0000707f,

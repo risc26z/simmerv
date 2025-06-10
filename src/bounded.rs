@@ -17,6 +17,8 @@ impl<const N: usize> Bounded<N> {
 
     #[must_use]
     pub const fn get(self) -> u8 { self.0 }
+
+    pub const MIN: Self = Self(0);
 }
 
 impl<T, const N: usize> Index<Bounded<N>> for [T; N] {
