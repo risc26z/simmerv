@@ -1,26 +1,46 @@
 use crate::cpu::Exception;
 use crate::cpu::Reg;
 use crate::riscv::MemoryAccessType::Read;
+use crate::riscv::MemoryAccessType::Write;
 
+// For instructions that need their source address.
+// Currently we use the full address but in future it will be an offset from
+// a per-translation base address
+type CodeAddr = i64;
 // XXX Tuples quickly become unclear.  Switch to regular structs
 #[derive(Default, Clone, Copy)]
 pub enum Op {
     #[default]
     Unimplemented,
-    Const(Reg, i64),
-    Jal(Reg, i64, i64),
-    Jalr(Reg, i64, i16),
-    Beq(i64),
-    Bne(i64),
-    Blt(i64),
-    Bge(i64),
-    Bltu(i64),
-    Bgeu(i64),
-    Lb(Reg, i16, i64), // XXX We'll definitely compress the instruction address in future.
-    Lh(Reg, i16, i64), // XXX We'll definitely compress the instruction address in future.
-    Lw(Reg, i16, i64), // XXX We'll definitely compress the instruction address in future.
-    Lbu(Reg, i16, i64), // XXX We'll definitely compress the instruction address in future.
-    Lhu(Reg, i16, i64), // XXX We'll definitely compress the instruction address in future.
+    Const(Reg, i64),         // XXX May keep the lui/auipc/...
+    Jal(Reg, i64, CodeAddr), // XXX Could be ~ Reg, i16, i16
+    Jalr(Reg, i16, CodeAddr),
+    Beq(CodeAddr),
+    Bne(CodeAddr),
+    Blt(CodeAddr),
+    Bge(CodeAddr),
+    Bltu(CodeAddr),
+    Bgeu(CodeAddr),
+    Lb(Reg, i16, CodeAddr), // XXX We'll definitely compress the instruction address in future.
+    Lh(Reg, i16, CodeAddr), // XXX We'll definitely compress the instruction address in future.
+    Lw(Reg, i16, CodeAddr), // XXX We'll definitely compress the instruction address in future.
+    Lbu(Reg, i16, CodeAddr), // XXX We'll definitely compress the instruction address in future.
+    Lhu(Reg, i16, CodeAddr), // XXX We'll definitely compress the instruction address in future.
+    Sb(i16, CodeAddr),      // XXX We'll definitely compress the instruction address in future.
+    Sh(i16, CodeAddr),      // XXX We'll definitely compress the instruction address in future.
+    Sw(i16, CodeAddr),      // XXX We'll definitely compress the instruction address in future.
+    Sd(i16, CodeAddr),      // XXX We'll definitely compress the instruction address in future.
+    Addi(Reg, i16),
+    Slti(Reg, i16),
+    Sltiu(Reg, i16),
+    Xori(Reg, i16),
+    Ori(Reg, i16),
+    Andi(Reg, i16),
+    Xor(Reg),
+    Or(Reg),
+    And(Reg),
+    Add(Reg),
+    Sub(Reg),
 }
 
 // Instruction in our virtual machine have two source registers as this is so
@@ -48,6 +68,7 @@ impl TranslationCache {
 #[allow(clippy::cast_sign_loss)]
 #[allow(clippy::cast_lossless)]
 #[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::too_many_lines)] // Literally unavoidable
 pub fn execute(code: &Code, cpu: &mut super::cpu::Cpu) -> Result<(), Exception> {
     for Insn(op, rs1, rs2) in code {
         let s1 = cpu.read_register(*rs1);
@@ -58,7 +79,7 @@ pub fn execute(code: &Code, cpu: &mut super::cpu::Cpu) -> Result<(), Exception> 
                 cpu.write_x(rd, retaddr);
                 cpu.pc = target;
             }
-            Op::Jalr(rd, retaddr, offset) => {
+            Op::Jalr(rd, offset, retaddr) => {
                 cpu.pc = s1.wrapping_add(i64::from(offset)) & !1;
                 cpu.write_x(rd, retaddr);
             }
@@ -93,22 +114,6 @@ pub fn execute(code: &Code, cpu: &mut super::cpu::Cpu) -> Result<(), Exception> 
                 }
             }
             Op::Lb(rd, offset, insn_addr) => {
-                // XXX This raises an issue!  If this throws an exception then
-                // how do we find the address of the faulting instruction?  Oops.
-                // Immediate options that come to mind:
-                //
-                // 1.* all state updates are rolled back/not committed and we retry in
-                // single-step mode
-                // 2. we keep enough information "somewhere" that we can recreate addresses
-                // 3. we keep count and find the address by tracing the instructions from the BB
-                //    entry (this in particular only works if we have a 1-1 mapping).
-                // 4.* variation on 2., for potentially-faulting insn, keep the address (as on
-                // offset) (* are the most promising ones)
-                //
-                // If we do any optimization on the generated code, then option 1. seems the
-                // only option, but that is not cheap, so a compromise for now,
-                // might be that state needs to be coherent at the
-                // time of a potentially-faulting insn (it acts as a serializing barrier).
                 cpu.insn_addr = insn_addr;
                 let v = cpu.memop(Read, s1, offset as i64, 0, 1)? as i8 as i64;
                 cpu.write_x(rd, v);
@@ -125,19 +130,43 @@ pub fn execute(code: &Code, cpu: &mut super::cpu::Cpu) -> Result<(), Exception> 
                 let v = cpu.memop(Read, s1, offset as i64, 0, 4)? as i32 as i64;
                 cpu.write_x(rd, v);
             }
-
             Op::Lbu(rd, offset, insn_addr) => {
                 cpu.insn_addr = insn_addr;
                 let v = cpu.memop(Read, s1, offset as i64, 0, 1)?;
                 cpu.write_x(rd, v);
             }
-
             Op::Lhu(rd, offset, insn_addr) => {
                 cpu.insn_addr = insn_addr;
                 let v = cpu.memop(Read, s1, offset as i64, 0, 2)?;
                 cpu.write_x(rd, v);
             }
-
+            Op::Sb(offset, insn_addr) => {
+                cpu.insn_addr = insn_addr;
+                let _ = cpu.memop(Write, s1, offset as i64, s2, 1)?;
+            }
+            Op::Sh(offset, insn_addr) => {
+                cpu.insn_addr = insn_addr;
+                let _ = cpu.memop(Write, s1, offset as i64, s2, 2)?;
+            }
+            Op::Sw(offset, insn_addr) => {
+                cpu.insn_addr = insn_addr;
+                let _ = cpu.memop(Write, s1, offset as i64, s2, 4)?;
+            }
+            Op::Sd(offset, insn_addr) => {
+                cpu.insn_addr = insn_addr;
+                let _ = cpu.memop(Write, s1, offset as i64, s2, 8)?;
+            }
+            Op::Addi(rd, imm) => cpu.write_x(rd, s1.wrapping_add(i64::from(imm))),
+            Op::Slti(rd, imm) => cpu.write_x(rd, i64::from(s1 < imm as i64)),
+            Op::Sltiu(rd, imm) => cpu.write_x(rd, i64::from((s1 as u64) < imm as i64 as u64)),
+            Op::Xori(rd, imm) => cpu.write_x(rd, s1 ^ i64::from(imm)),
+            Op::Ori(rd, imm) => cpu.write_x(rd, s1 | i64::from(imm)),
+            Op::Andi(rd, imm) => cpu.write_x(rd, s1 & i64::from(imm)),
+            Op::Xor(rd) => cpu.write_x(rd, s1 ^ s2),
+            Op::Or(rd) => cpu.write_x(rd, s1 | s2),
+            Op::And(rd) => cpu.write_x(rd, s1 & s2),
+            Op::Add(rd) => cpu.write_x(rd, s1.wrapping_add(s2)),
+            Op::Sub(rd) => cpu.write_x(rd, s1.wrapping_sub(s2)),
             Op::Unimplemented => todo!(),
         }
     }

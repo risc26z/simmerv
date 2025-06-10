@@ -1538,8 +1538,8 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(Insn(
                 Op::Jalr(
                     rd,
-                    address + (if orig_word % 4 == 3 { 4 } else { 2 }),
                     imm as i16,
+                    address + (if orig_word % 4 == 3 { 4 } else { 2 }),
                 ),
                 rs1,
                 Reg::MIN,
@@ -1745,7 +1745,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_s,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _| {
+            let FormatS { rs1, rs2, imm } = parse_format_s(word);
+            Ok(Insn(Op::Sb(imm as i16, address), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1759,7 +1762,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_s,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _| {
+            let FormatS { rs1, rs2, imm } = parse_format_s(word);
+            Ok(Insn(Op::Sh(imm as i16, address), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1773,7 +1779,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_s,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _| {
+            let FormatS { rs1, rs2, imm } = parse_format_s(word);
+            Ok(Insn(Op::Sw(imm as i16, address), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1786,7 +1795,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address, word: u32, _| {
+            let FormatI { rd, rs1, imm } = parse_format_i(word);
+            Ok(Insn(Op::Addi(rd, imm as i16), rs1, Reg::MIN))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1799,7 +1811,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let FormatI { rd, rs1, imm } = parse_format_i(word);
+            Ok(Insn(Op::Slti(rd, imm as i16), rs1, Reg::MIN))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1812,7 +1827,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let FormatI { rd, rs1, imm } = parse_format_i(word);
+            Ok(Insn(Op::Sltiu(rd, imm as i16), rs1, Reg::MIN))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1825,7 +1843,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let FormatI { rd, rs1, imm } = parse_format_i(word);
+            Ok(Insn(Op::Xori(rd, imm as i16), rs1, Reg::MIN))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1838,7 +1859,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let FormatI { rd, rs1, imm } = parse_format_i(word);
+            Ok(Insn(Op::Ori(rd, imm as i16), rs1, Reg::MIN))
+        },
     },
     Instruction {
         mask: 0x0000707f,
@@ -1851,7 +1875,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_i,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let FormatI { rd, rs1, imm } = parse_format_i(word);
+            Ok(Insn(Op::Andi(rd, imm as i16), rs1, Reg::MIN))
+        },
     },
     // RV32I SLLI subsumed by RV64I
     // RV32I SRLI subsumed by RV64I
@@ -1868,7 +1895,15 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let FormatR {
+                rd,
+                rs1,
+                rs2,
+                funct3: _,
+            } = parse_format_r(word);
+            Ok(Insn(Op::Add(rd), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1882,7 +1917,15 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let FormatR {
+                rd,
+                rs1,
+                rs2,
+                funct3: _,
+            } = parse_format_r(word);
+            Ok(Insn(Op::Sub(rd), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2098,7 +2141,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_s,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |address, word, _| {
+            let FormatS { rs1, rs2, imm } = parse_format_s(word);
+            Ok(Insn(Op::Sd(imm as i16, address), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0xfc00707f, // RV64I version!
