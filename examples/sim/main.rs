@@ -46,7 +46,7 @@ fn main() -> std::io::Result<()> {
         "Enable experimental page cache optimization",
     );
 
-    let matches = match opts.parse(&args[1..]) {
+    let matches = match opts.parse(&args[2..]) {
         Ok(m) => m,
         Err(f) => {
             println!("{f}");
@@ -94,6 +94,11 @@ fn main() -> std::io::Result<()> {
     let mut elf_contents = vec![];
     elf_file.read_to_end(&mut elf_contents)?;
 
+    let initrd_filename = args[2].clone();
+    let mut initrd_file = File::open(initrd_filename)?;
+    let mut initrd_contents = vec![];
+    initrd_file.read_to_end(&mut initrd_contents)?;
+
     let terminal_type = if matches.opt_present("n") {
         TerminalType::DummyTerminal
     } else {
@@ -109,6 +114,21 @@ fn main() -> std::io::Result<()> {
     if matches.opt_present("p") {
         emulator.enable_page_cache(true);
     }
+
+    for (j, b) in initrd_contents.iter().enumerate() {
+        if emulator
+            .cpu
+            .get_mut_mmu()
+            .store_phys_u8(0x86000000 + j as u64, *b)
+            .is_err()
+        {
+            panic!(
+                "Program doesn't fit in memory: 0x{:016x}",
+                0x86000000 + j as u64
+            );
+        }
+    }
+
     emulator.run(matches.opt_present("t"));
     Ok(())
 }

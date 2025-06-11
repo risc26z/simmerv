@@ -37,7 +37,7 @@ use fnv::FnvHashMap;
 /// emulator.run();
 /// ```
 pub struct Emulator {
-    cpu: Cpu,
+    pub cpu: Cpu,
 
     /// Stores mapping from symbol to virtual address
     symbol_map: FnvHashMap<String, u64>,
