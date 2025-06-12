@@ -41,8 +41,20 @@ pub const PG_SHIFT: usize = 12; // 4K page size
 
 pub type Reg = Bounded<65>;
 impl Reg {
+    // This is slightly bad; we use Register 64 as the drain (where writes to x0
+    // actually goes instead of conditionally suppressing it).  However, we also
+    // want to be able to signal to future clients that a register might not be
+    // used by an instruction and we don't want to introduce a dummy register
+    // just for that, nor want to wrap everything in Option (for many reasons).
+    // However it would be a bug if we ever _used_ the value read from drain.
+    pub const UNUSED: Self = Self::MAX;
+
+    // Slightly awkward: some instructions need to know if their destination is x0,
+    // but we have already remapped x0 to drain (for destinations only).  It is
+    // illegal to use this on a source register but we don't have a way to
+    // enforce this.
     #[must_use]
-    pub const fn is_x0_dest(self) -> bool { self.get() == 64 }
+    pub fn is_x0_dest(self) -> bool { self == Self::MAX }
 }
 
 /// Generate a source integer `Reg`
@@ -1433,7 +1445,7 @@ const fn get_register_name(num: Reg) -> &'static str {
         "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4",
         "t5", "t6", "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11",
         "f12", "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24",
-        "f25", "f26", "f27", "f28", "f29", "f30", "f31", "x0",
+        "f25", "f26", "f27", "f28", "f29", "f30", "f31", "drain",
     ][num.get() as usize]
 }
 
@@ -1465,7 +1477,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_u,
         translate: |_address, word, _orig_word| {
             let FormatU { rd, imm } = parse_format_u(word);
-            Ok(Insn(Op::Const(rd, imm), Reg::MIN, Reg::MIN))
+            Ok(Insn(Op::Const(rd, imm), Reg::UNUSED, Reg::UNUSED))
         },
     },
     Instruction {
@@ -1482,8 +1494,8 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             let FormatU { rd, imm } = parse_format_u(word);
             Ok(Insn(
                 Op::Const(rd, address.wrapping_add(imm)),
-                Reg::MIN,
-                Reg::MIN,
+                Reg::UNUSED,
+                Reg::UNUSED,
             ))
         },
     },
@@ -1506,8 +1518,8 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
                         address + (if orig_word % 4 == 3 { 4 } else { 2 }),
                         address.wrapping_add(imm),
                     ),
-                    Reg::MIN,
-                    Reg::MIN,
+                    Reg::UNUSED,
+                    Reg::UNUSED,
                 ))
             })
         },
@@ -1542,7 +1554,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
                     address + (if orig_word % 4 == 3 { 4 } else { 2 }),
                 ),
                 rs1,
-                Reg::MIN,
+                Reg::UNUSED,
             ))
         },
     },
@@ -1662,7 +1674,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_i_mem,
         translate: |address, word, _| {
             let FormatI { rd, rs1, imm } = parse_format_i(word);
-            Ok(Insn(Op::Lb(rd, imm as i16, address), rs1, Reg::MIN))
+            Ok(Insn(Op::Lb(rd, imm as i16, address), rs1, Reg::UNUSED))
         },
     },
     Instruction {
@@ -1679,7 +1691,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_i_mem,
         translate: |address, word, _| {
             let FormatI { rd, rs1, imm } = parse_format_i(word);
-            Ok(Insn(Op::Lh(rd, imm as i16, address), rs1, Reg::MIN))
+            Ok(Insn(Op::Lh(rd, imm as i16, address), rs1, Reg::UNUSED))
         },
     },
     Instruction {
@@ -1696,7 +1708,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_i_mem,
         translate: |address, word, _| {
             let FormatI { rd, rs1, imm } = parse_format_i(word);
-            Ok(Insn(Op::Lw(rd, imm as i16, address), rs1, Reg::MIN))
+            Ok(Insn(Op::Lw(rd, imm as i16, address), rs1, Reg::UNUSED))
         },
     },
     Instruction {
@@ -1713,7 +1725,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_i_mem,
         translate: |address, word, _| {
             let FormatI { rd, rs1, imm } = parse_format_i(word);
-            Ok(Insn(Op::Lbu(rd, imm as i16, address), rs1, Reg::MIN))
+            Ok(Insn(Op::Lbu(rd, imm as i16, address), rs1, Reg::UNUSED))
         },
     },
     Instruction {
@@ -1730,7 +1742,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_i_mem,
         translate: |address, word, _| {
             let FormatI { rd, rs1, imm } = parse_format_i(word);
-            Ok(Insn(Op::Lhu(rd, imm as i16, address), rs1, Reg::MIN))
+            Ok(Insn(Op::Lhu(rd, imm as i16, address), rs1, Reg::UNUSED))
         },
     },
     Instruction {
@@ -1797,7 +1809,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_i,
         translate: |_address, word: u32, _| {
             let FormatI { rd, rs1, imm } = parse_format_i(word);
-            Ok(Insn(Op::Addi(rd, imm as i16), rs1, Reg::MIN))
+            Ok(Insn(Op::Addi(rd, imm as i16), rs1, Reg::UNUSED))
         },
     },
     Instruction {
@@ -1813,7 +1825,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_i,
         translate: |_address: i64, word: u32, _| {
             let FormatI { rd, rs1, imm } = parse_format_i(word);
-            Ok(Insn(Op::Slti(rd, imm as i16), rs1, Reg::MIN))
+            Ok(Insn(Op::Slti(rd, imm as i16), rs1, Reg::UNUSED))
         },
     },
     Instruction {
@@ -1829,7 +1841,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_i,
         translate: |_address: i64, word: u32, _| {
             let FormatI { rd, rs1, imm } = parse_format_i(word);
-            Ok(Insn(Op::Sltiu(rd, imm as i16), rs1, Reg::MIN))
+            Ok(Insn(Op::Sltiu(rd, imm as i16), rs1, Reg::UNUSED))
         },
     },
     Instruction {
@@ -1845,7 +1857,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_i,
         translate: |_address: i64, word: u32, _| {
             let FormatI { rd, rs1, imm } = parse_format_i(word);
-            Ok(Insn(Op::Xori(rd, imm as i16), rs1, Reg::MIN))
+            Ok(Insn(Op::Xori(rd, imm as i16), rs1, Reg::UNUSED))
         },
     },
     Instruction {
@@ -1861,7 +1873,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_i,
         translate: |_address: i64, word: u32, _| {
             let FormatI { rd, rs1, imm } = parse_format_i(word);
-            Ok(Insn(Op::Ori(rd, imm as i16), rs1, Reg::MIN))
+            Ok(Insn(Op::Ori(rd, imm as i16), rs1, Reg::UNUSED))
         },
     },
     Instruction {
@@ -1877,7 +1889,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
         disassemble: dump_format_i,
         translate: |_address: i64, word: u32, _| {
             let FormatI { rd, rs1, imm } = parse_format_i(word);
-            Ok(Insn(Op::Andi(rd, imm as i16), rs1, Reg::MIN))
+            Ok(Insn(Op::Andi(rd, imm as i16), rs1, Reg::UNUSED))
         },
     },
     // RV32I SLLI subsumed by RV64I

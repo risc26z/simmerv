@@ -19,6 +19,9 @@ impl<const N: usize> Bounded<N> {
     pub const fn get(self) -> u8 { self.0 }
 
     pub const MIN: Self = Self(0);
+
+    #[allow(clippy::cast_possible_truncation)]
+    pub const MAX: Self = Self((N - 1) as u8);
 }
 
 impl<T, const N: usize> Index<Bounded<N>> for [T; N] {
