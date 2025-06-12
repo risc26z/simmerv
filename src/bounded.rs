@@ -1,7 +1,7 @@
 use core::ops::Index;
 use core::ops::IndexMut;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Bounded<const N: usize>(u8);
 
 impl<const N: usize> Bounded<N> {

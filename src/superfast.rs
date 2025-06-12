@@ -8,7 +8,7 @@ use crate::riscv::MemoryAccessType::Write;
 // a per-translation base address
 type CodeAddr = i64;
 // XXX Tuples quickly become unclear.  Switch to regular structs
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub enum Op {
     #[default]
     Unimplemented,
@@ -41,6 +41,11 @@ pub enum Op {
     And(Reg),
     Add(Reg),
     Sub(Reg),
+    Sll(Reg),
+    Srl(Reg),
+    Sra(Reg),
+    Slt(Reg),
+    Sltu(Reg),
 }
 
 // Instruction in our virtual machine have two source registers as this is so
@@ -48,6 +53,23 @@ pub enum Op {
 // registers up-front so the fetch can happen in the shadow of the dispatch,
 // even though there a small downside for instruction that need fewer or even no
 // source registers.  Well, at least that the theory.
+//
+// XXX Should we factor out the destination register and always assign?  I
+// suspect it might lead to less code in the execution loop at the cost of
+// assigning to drain for instructions that doesn't return a result.  Very few
+// common instruction would be affected: branches and stores are the main ones.
+//
+// Instruction sizes: currently Jal is the worst case, needing both the original
+// address and a destination address. Representing the source address depends on
+// the assumptions;
+// - 64b when we can't assume anything
+// - 16b when we can assume all source instruction come from a 64k window around
+//   a baseaddress (which needs to be stored somewhere).
+// - 1b when we can assume that all instructions come from a linear sequence
+//   starting with the base address (+ follow jumps with some complication).
+//   However reconstructing the address this way is expensive which is
+//   unacceptable for jal (but ok for excepting instructions).
+//
 pub struct Insn(pub Op, pub Reg, pub Reg);
 pub type Code = Vec<Insn>;
 
@@ -68,16 +90,18 @@ impl TranslationCache {
 #[allow(clippy::cast_sign_loss)]
 #[allow(clippy::cast_lossless)]
 #[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_wrap)]
 #[allow(clippy::too_many_lines)] // Literally unavoidable
 pub fn execute(code: &Code, cpu: &mut super::cpu::Cpu) -> Result<(), Exception> {
     for Insn(op, rs1, rs2) in code {
+        println!("{op:x?} {rs1},{rs2}");
         let s1 = cpu.read_register(*rs1);
         let s2 = cpu.read_register(*rs2);
         match *op {
             Op::Const(rd, k) => cpu.write_x(rd, k),
             Op::Jal(rd, retaddr, target) => {
-                cpu.write_x(rd, retaddr);
                 cpu.pc = target;
+                cpu.write_x(rd, retaddr);
             }
             Op::Jalr(rd, offset, retaddr) => {
                 cpu.pc = s1.wrapping_add(i64::from(offset)) & !1;
@@ -167,6 +191,12 @@ pub fn execute(code: &Code, cpu: &mut super::cpu::Cpu) -> Result<(), Exception> 
             Op::And(rd) => cpu.write_x(rd, s1 & s2),
             Op::Add(rd) => cpu.write_x(rd, s1.wrapping_add(s2)),
             Op::Sub(rd) => cpu.write_x(rd, s1.wrapping_sub(s2)),
+            Op::Sll(rd) => cpu.write_x(rd, s1.wrapping_shl(s2 as u32)),
+            Op::Srl(rd) => cpu.write_x(rd, (s1 as u64).wrapping_shr(s2 as u32) as i64),
+            Op::Sra(rd) => cpu.write_x(rd, s1.wrapping_shr(s2 as u32)),
+            Op::Slt(rd) => cpu.write_x(rd, i64::from(s1 < s2)),
+            Op::Sltu(rd) => cpu.write_x(rd, i64::from((s1 as u64) < (s2 as u64))),
+
             Op::Unimplemented => todo!(),
         }
     }

@@ -32,7 +32,10 @@ use riscv::MemoryAccessType::Write;
 use riscv::PrivMode;
 use riscv::Trap;
 use riscv::priv_mode_from;
+use std::fmt::Display;
+use std::fmt::Formatter;
 use std::fmt::Write as _;
+use std::result::Result;
 use terminal::Terminal;
 
 pub const CONFIG_SW_MANAGED_A_AND_D: bool = false;
@@ -55,6 +58,18 @@ impl Reg {
     // enforce this.
     #[must_use]
     pub fn is_x0_dest(self) -> bool { self == Self::MAX }
+}
+
+impl Display for Reg {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "{}", get_register_name(*self))
+    }
+}
+
+impl std::fmt::Debug for Reg {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "{}", get_register_name(*self))
+    }
 }
 
 /// Generate a source integer `Reg`
@@ -1445,7 +1460,7 @@ const fn get_register_name(num: Reg) -> &'static str {
         "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4",
         "t5", "t6", "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11",
         "f12", "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24",
-        "f25", "f26", "f27", "f28", "f29", "f30", "f31", "drain",
+        "f25", "f26", "f27", "f28", "f29", "f30", "f31", "-",
     ][num.get() as usize]
 }
 
@@ -1951,7 +1966,15 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let FormatR {
+                rd,
+                rs1,
+                rs2,
+                funct3: _,
+            } = parse_format_r(word);
+            Ok(Insn(Op::Sll(rd), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1965,7 +1988,15 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let FormatR {
+                rd,
+                rs1,
+                rs2,
+                funct3: _,
+            } = parse_format_r(word);
+            Ok(Insn(Op::Slt(rd), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1979,7 +2010,15 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let FormatR {
+                rd,
+                rs1,
+                rs2,
+                funct3: _,
+            } = parse_format_r(word);
+            Ok(Insn(Op::Sltu(rd), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0xfe00707f,
@@ -1993,7 +2032,15 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let FormatR {
+                rd,
+                rs1,
+                rs2,
+                funct3: _,
+            } = parse_format_r(word);
+            Ok(Insn(Op::Xor(rd), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2007,7 +2054,15 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let FormatR {
+                rd,
+                rs1,
+                rs2,
+                funct3: _,
+            } = parse_format_r(word);
+            Ok(Insn(Op::Srl(rd), rs1, rs2))
+        },
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2021,7 +2076,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let f = parse_format_r(word);
+            Ok(Insn(Op::Sra(f.rd), f.rs1, f.rs2))
+        },
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2035,7 +2093,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let f = parse_format_r(word);
+            Ok(Insn(Op::Or(f.rd), f.rs1, f.rs2))
+        },
     },
     Instruction {
         mask: 0xfe00707f,
@@ -2049,7 +2110,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
             Ok(())
         },
         disassemble: dump_format_r,
-        translate: |_, _, _| DUMMY_ERROR,
+        translate: |_address: i64, word: u32, _| {
+            let f = parse_format_r(word);
+            Ok(Insn(Op::And(f.rd), f.rs1, f.rs2))
+        },
     },
     Instruction {
         mask: 0xf000707f,
